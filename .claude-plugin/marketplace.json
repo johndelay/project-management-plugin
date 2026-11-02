@@ -1,0 +1,23 @@
+{
+  "name": "thedelay",
+  "owner": {
+    "name": "John DeLay",
+    "email": "3052450+johndelay@users.noreply.github.com"
+  },
+  "metadata": {
+    "description": "A plugin marketplace with one plugin, project-management: plan features and projects through gated phases, with a read-only plan checker."
+  },
+  "plugins": [
+    {
+      "name": "project-management",
+      "source": "./",
+      "description": "Plan a feature or project through gated phases: value check, spec, independent review, a parallel execution plan, a build verified on the merged tree, and a close that re-measures value. Ships a read-only plan checker.",
+      "version": "3.0.0",
+      "author": {
+        "name": "John DeLay",
+        "email": "3052450+johndelay@users.noreply.github.com"
+      },
+      "license": "MIT"
+    }
+  ]
+}

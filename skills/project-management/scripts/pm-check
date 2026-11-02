@@ -1,0 +1,1303 @@
+#!/usr/bin/env python3
+"""pm-check: shape checks for a /project-management plan.
+
+    python3 pm-check <plan.md> [--config <pm.config.md>] [--today YYYY-MM-DD]
+    python3 pm-check overlap --base <sha> <branch>... [--plan <plan.md>]     (run inside the git repo)
+
+It checks SHAPE, not truth: that the gate lines follow the grammar, that the status line agrees
+with them, that a closed plan has no open boxes, and so on. It cannot tell whether a plan is right.
+
+Exit codes
+    0  no ERROR or WARN (INFO never changes the exit code)
+    1  at least one ERROR or WARN
+    2  could not check: unreadable input, an unparseable config, a git error, or the embedded
+       control failed. Exit 2 is never a clean result.
+Output, one line per finding:  ERROR|WARN|INFO <rule> L<n>: <message>   (L0 = the whole file)
+
+A plan without the line `<!-- pm-template: v3 -->` is a legacy plan: every finding is reported
+as INFO and the exit code is 0, so you can read what a v3 plan would be told.
+
+Every run first checks a planted plan held in this file (the embedded control, rule P0). If this
+script cannot find the planted defects, its silence on your plan would mean nothing, so it exits 2.
+
+Read-only. Python 3.8+, standard library and git only.
+"""
+import argparse
+import datetime
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+import traceback
+
+MARKER = "<!-- pm-template: v3 -->"
+GATES = ("intake", "value", "spec", "review", "plan", "build", "close")
+DEFAULT_OWNER_TAG = "[O]"
+DEFAULT_ID_SCHEME = r"D\d+"
+RULE_ORDER = ("P0", "P2", "P4", "P5", "P10", "P11", "P12", "P13", "P15", "P16", "overlap")
+SMALL_BYTES = 10 * 1024  # the spine's "small" bound: plan <= 10 KB
+
+
+class CheckError(Exception):
+    """Could not check (exit 2). `where` is printed as the rule name and `line` as L<n>."""
+
+    def __init__(self, where, line, msg):
+        Exception.__init__(self, msg)
+        self.where, self.line, self.msg = where, line, msg
+
+
+def short(s, n=60):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# Config: the first fenced ```yaml block of pm.config.md, read by a small parser for the
+# subset the template uses. Anything outside the subset is refused with its line number
+# (exit 2), never guessed at.
+#   key: value · "double" and 'single' quoted strings (colons inside quotes are kept) ·
+#   # comments · flow maps {a: "b", c: d} · flow lists [a, b] · "- item" lists ·
+#   one level of nested map
+# ════════════════════════════════════════════════════════════════════════════════════════
+_EMPTY = object()
+_KEY = re.compile(r"([A-Za-z0-9_./][^:#]*?)\s*:(?=[ \t]|$)")
+_FLOW_KEY = re.compile(r"[^:,{}\[\]#]+")
+
+
+class _Scan(object):
+    """Parses one value: the text after `key:` or after `- `."""
+
+    def __init__(self, s, lineno):
+        self.s, self.i, self.ln = s, 0, lineno
+
+    def fail(self, msg):
+        raise CheckError("config", self.ln, msg)
+
+    def peek(self):
+        return self.s[self.i] if self.i < len(self.s) else ""
+
+    def ws(self):
+        j = self.i
+        while self.i < len(self.s) and self.s[self.i] in " \t":
+            self.i += 1
+        return self.i > j
+
+    def quoted(self):
+        q = self.s[self.i]
+        self.i += 1
+        out = []
+        while self.i < len(self.s):
+            c = self.s[self.i]
+            if q == '"' and c == "\\" and self.i + 1 < len(self.s):
+                nxt = self.s[self.i + 1]
+                out.append(nxt if nxt in '"\\' else c + nxt)
+                self.i += 2
+                continue
+            if c == q:
+                if q == "'" and self.s[self.i + 1:self.i + 2] == "'":
+                    out.append("'")
+                    self.i += 2
+                    continue
+                self.i += 1
+                return "".join(out)
+            out.append(c)
+            self.i += 1
+        self.fail("unterminated quoted string")
+
+    def plain(self, flow):
+        j = self.i
+        while self.i < len(self.s):
+            c = self.s[self.i]
+            if flow and c in ",]}":
+                break
+            if c == "#" and self.i > j and self.s[self.i - 1] in " \t":
+                break
+            self.i += 1
+        v = self.s[j:self.i].rstrip()
+        self.i = j + len(v)
+        if not v:
+            self.fail("empty value")
+        if re.search(r":(\s|$)", v):
+            self.fail("a plain value holding ': ' (or ending in ':') is ambiguous; quote it")
+        return None if v in ("null", "Null", "NULL", "~") else v
+
+    def flow_item(self):
+        c = self.peek()
+        if c in ("\"", "'"):
+            return self.quoted()
+        if c in ("[", "{"):
+            self.fail("a [list] or {map} nested inside another is outside the subset")
+        if c in ("", ",", "]", "}"):
+            self.fail("empty item in a flow [list] or {map}")
+        return self.plain(flow=True)
+
+    def flow_list(self):
+        self.i += 1
+        out = []
+        self.ws()
+        if self.peek() == "]":
+            self.i += 1
+            return out
+        while True:
+            self.ws()
+            out.append(self.flow_item())
+            self.ws()
+            c = self.peek()
+            self.i += 1
+            if c == ",":
+                continue
+            if c == "]":
+                return out
+            self.fail("a [list] must close with ']' on the same line")
+
+    def flow_map(self):
+        self.i += 1
+        out = {}
+        self.ws()
+        if self.peek() == "}":
+            self.i += 1
+            return out
+        while True:
+            self.ws()
+            if self.peek() in ("\"", "'"):
+                k = self.quoted()
+            else:
+                m = _FLOW_KEY.match(self.s, self.i)
+                if not m:
+                    self.fail("expected a key inside {map}")
+                k = m.group(0).strip()
+                self.i = m.end()
+            if not k:
+                self.fail("empty key inside {map}")
+            if self.peek() != ":":
+                self.fail("expected ': ' after key %r inside {map}" % k)
+            self.i += 1
+            if not self.ws():
+                self.fail("expected a space after '%s:' inside {map}" % k)
+            if k in out:
+                self.fail("key %r appears twice inside {map}" % k)
+            out[k] = self.flow_item()
+            self.ws()
+            c = self.peek()
+            self.i += 1
+            if c == ",":
+                continue
+            if c == "}":
+                return out
+            self.fail("a {map} must close with '}' on the same line")
+
+    def value(self):
+        self.ws()
+        if self.i >= len(self.s) or self.peek() == "#":
+            return _EMPTY
+        c = self.peek()
+        if c in ("\"", "'"):
+            v = self.quoted()
+        elif c == "[":
+            v = self.flow_list()
+        elif c == "{":
+            v = self.flow_map()
+        elif c in ("|", ">"):
+            self.fail("block scalars ('|' or '>') are outside the subset")
+        elif c in ("&", "*", "!", "%", "@", "`", "?"):
+            self.fail("anchors, aliases, tags and reserved indicators are outside the subset")
+        elif c == "-" and self.s[self.i + 1:self.i + 2] in (" ", ""):
+            self.fail("a '- item' must start on its own line")
+        else:
+            v = self.plain(flow=False)
+        had_ws = self.ws()
+        if self.i < len(self.s) and not (had_ws and self.peek() == "#"):
+            self.fail("unexpected text after the value: %r" % short(self.s[self.i:], 40))
+        return v
+
+
+def parse_config(text, path):
+    """-> (data, where). `where` maps each top-level key to its line. Raises CheckError."""
+    lines = text.split("\n")
+    start = end = fence = None
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if start is None:
+            m = re.match(r"^(`{3,}|~{3,})\s*yaml$", s)
+            if m:
+                start, fence = i, m.group(1)
+        elif re.match("^" + re.escape(fence[0]) + "{%d,}$" % len(fence), s):
+            end = i
+            break
+    if start is None:
+        raise CheckError("config", 0, "%s: no fenced ```yaml block" % path)
+    if end is None:
+        raise CheckError("config", start + 1, "%s: the ```yaml block is never closed" % path)
+
+    def fail(ln, msg):
+        raise CheckError("config", ln, "%s: %s" % (path, msg))
+
+    data, where = {}, {}
+    cur = cur_kind = cur_indent = None
+    for i in range(start + 1, end):
+        ln = i + 1
+        raw = lines[i].rstrip("\r")
+        body = raw.lstrip(" \t")
+        if not body.strip() or body.startswith("#"):
+            continue
+        lead = raw[: len(raw) - len(body)]
+        if "\t" in lead:
+            fail(ln, "tab indentation is outside the subset")
+        indent = len(lead)
+        try:
+            if indent == 0:
+                if body == "-" or body.startswith("- "):
+                    fail(ln, "a top-level list is outside the subset")
+                m = _KEY.match(body)
+                if not m:
+                    fail(ln, "not 'key: value': %r" % short(body, 40))
+                key = m.group(1).strip()
+                if key in data:
+                    fail(ln, "key %r appears twice" % key)
+                v = _Scan(body[m.end():], ln).value()
+                where[key] = ln
+                if v is _EMPTY:
+                    data[key] = None
+                    cur, cur_kind, cur_indent = key, None, None
+                else:
+                    data[key] = v
+                    cur = None
+                continue
+            if cur is None:
+                fail(ln, "an indented line with no 'key:' above it (only one level of nesting)")
+            is_item = body == "-" or body.startswith("- ")
+            if cur_indent is None:
+                cur_indent = indent
+                cur_kind = "list" if is_item else "map"
+                data[cur] = [] if is_item else {}
+            elif indent != cur_indent:
+                fail(ln, "indentation differs from the line above; only one level of nesting is supported")
+            if cur_kind == "list":
+                if not is_item:
+                    fail(ln, "expected '- item' (the list under %r)" % cur)
+                v = _Scan(body[1:], ln).value()
+                if v is _EMPTY:
+                    fail(ln, "empty list item")
+                if isinstance(v, (dict, list)):
+                    fail(ln, "a list item must be a single value (one level of nesting)")
+                data[cur].append(v)
+            else:
+                if is_item:
+                    fail(ln, "a '- item' inside the map under %r" % cur)
+                m = _KEY.match(body)
+                if not m:
+                    fail(ln, "not 'key: value': %r" % short(body, 40))
+                k = m.group(1).strip()
+                if k in data[cur]:
+                    fail(ln, "key %r appears twice under %r" % (k, cur))
+                v = _Scan(body[m.end():], ln).value()
+                if v is _EMPTY:
+                    fail(ln, "a second level of nesting (under %r) is outside the subset" % k)
+                data[cur][k] = v
+        except CheckError as e:
+            if not e.msg.startswith(path + ": "):
+                e.msg = "%s: %s" % (path, e.msg)
+            raise
+    return data, where
+
+
+def config_fields(data, where, path):
+    """The three fields pm-check reads, validated. Raises CheckError naming the line."""
+    cfg = {"path": path, "status_map": None, "owner_tag": DEFAULT_OWNER_TAG,
+           "id_scheme": DEFAULT_ID_SCHEME}
+    sm = data.get("status_map")
+    if sm is not None:
+        if not isinstance(sm, dict):
+            raise CheckError("config", where["status_map"], "%s: status_map must be a map" % path)
+        cfg["status_map"] = sm
+    st = data.get("step_tags")
+    if st is not None:
+        if not isinstance(st, dict):
+            raise CheckError("config", where["step_tags"], "%s: step_tags must be a map" % path)
+        if st.get("owner") is not None:
+            if not isinstance(st["owner"], str):
+                raise CheckError("config", where["step_tags"], "%s: step_tags.owner must be text" % path)
+            cfg["owner_tag"] = st["owner"]
+    ids = data.get("id_scheme")
+    if ids is not None:
+        if not isinstance(ids, str):
+            raise CheckError("config", where["id_scheme"], "%s: id_scheme must be a regex string" % path)
+        try:
+            rx = re.compile(ids)
+        except re.error as e:
+            raise CheckError("config", where["id_scheme"], "%s: id_scheme is not a valid regex (%s)" % (path, e))
+        if rx.fullmatch(""):
+            raise CheckError("config", where["id_scheme"], "%s: id_scheme matches the empty string" % path)
+        cfg["id_scheme"] = ids
+    cfg["id_re"] = re.compile(r"(?<![\w])(?:%s)(?![\w])" % cfg["id_scheme"])
+    return cfg
+
+
+def default_config():
+    return config_fields({}, {}, None)
+
+
+def load_config(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise CheckError("config", 0, "%s: cannot read (%s)" % (path, e))
+    data, where = parse_config(text, path)
+    return config_fields(data, where, path)
+
+
+def find_config(plan_path):
+    """The nearest pm.config.md, walking up from the plan's directory."""
+    d = os.path.dirname(os.path.abspath(plan_path))
+    while True:
+        p = os.path.join(d, "pm.config.md")
+        if os.path.isfile(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# The plan
+# ════════════════════════════════════════════════════════════════════════════════════════
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_INLINE = re.compile(r"(`+)(.+?)\1(?!`)")
+_HEAD = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_GATE = re.compile(r"^(?:\*\*)?Gate \(([^)]*)\):(.*)$")
+_LIST = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+")
+_BOX = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+\[([ xX])\]")
+_PLACEHOLDER = re.compile(r"\{\{[^{}\n]*\}\}")
+_STATUS = re.compile(r"\*\*Status:\*\*(.*)$")
+
+
+def strip_code(line):
+    return _INLINE.sub(" ", line)
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _st(p):
+    return re.compile(p + r"(?![\w])")
+
+
+# § 5 of the spec: the state is the longest pattern that matches at the start of the gate text.
+_STATES = {
+    "intake": [("pending", _st("pending")), ("captured", _st("captured"))],
+    "value": [("pending", _st("pending")), ("SPIKE-FIRST", _st("SPIKE-FIRST")), ("GO", _st("GO")),
+              ("NO-GO", _st("NO-GO"))],
+    "spec": [("pending", _st("pending")), ("drafted", _st("drafted"))],
+    "review": [("pending", _st("pending")), ("passes", _st(r"\d+ pass(?:es)?")), ("waived", _st("waived"))],
+    "plan": [("pending go-ahead", _st("pending go-ahead")), ("go (scope)", _st(r"go \([^)]+\)")),
+             ("go", _st("go"))],
+    "build": [("pending", _st("pending")), ("in progress", _st("in progress")),
+              ("built + verified", _st(r"built \+ verified")),
+              ("built, awaiting owner observation", _st("built, awaiting owner observation"))],
+    "close": [("pending", _st("pending")), ("partial", _st("partial")), ("DONE", _st("DONE")),
+              ("ABANDONED", _st("ABANDONED"))],
+}
+_PARKED = ("PARKED", re.compile(r"PARKED — re-entry: \S.*?; exposed: \S.*"))
+_VOCAB = {
+    "intake": "pending · captured",
+    "value": "pending · SPIKE-FIRST · GO · NO-GO",
+    "spec": "pending · drafted",
+    "review": "pending · <N> pass(es) · waived",
+    "plan": "pending go-ahead · go (<scope>) · go",
+    "build": "pending · in progress · built + verified · built, awaiting owner observation",
+    "close": "pending · partial · DONE · ABANDONED",
+}
+_PHASE = {
+    ("intake", "captured"): "intake",
+    ("value", "SPIKE-FIRST"): "value", ("value", "GO"): "value", ("value", "NO-GO"): "abandoned",
+    ("spec", "drafted"): "spec",
+    ("review", "passes"): "review", ("review", "waived"): "review",
+    ("plan", "go (scope)"): "planned", ("plan", "go"): "planned",
+    ("build", "in progress"): "building", ("build", "built + verified"): "building",
+    ("build", "built, awaiting owner observation"): "building",
+    ("close", "partial"): "building", ("close", "DONE"): "closed", ("close", "ABANDONED"): "abandoned",
+}
+
+
+def gate_state(name, text):
+    """-> (state key or None, pending). Leading ** emphasis is ignored."""
+    t = text.strip()
+    while t.startswith("**"):
+        t = t[2:].lstrip()
+    best = None
+    for key, rx in _STATES.get(name, []) + [_PARKED]:
+        m = rx.match(t)
+        if m and (best is None or m.end() > best[1]):
+            best = (key, m.end())
+    state = best[0] if best else None
+    pending = state.startswith("pending") if state else t.startswith("pending")
+    return state, pending
+
+
+class Gate(object):
+    def __init__(self, i, name, text):
+        self.i, self.name, self.text = i, name, text.strip()
+        self.state, self.pending = gate_state(name, text)
+        if self.state == "PARKED":
+            self.phase = "parked"
+        else:
+            self.phase = _PHASE.get((name, self.state))
+
+
+class Plan(object):
+    def __init__(self, text):
+        if text.startswith("﻿"):
+            text = text[1:]
+        self.lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+        self.n = len(self.lines)
+        self.in_code = [False] * self.n
+        fence = None
+        for i, l in enumerate(self.lines):
+            m = _FENCE.match(l)
+            if fence is None:
+                if m:
+                    fence = m.group(1)
+                    self.in_code[i] = True
+            else:
+                self.in_code[i] = True
+                if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                        and l.strip() == m.group(1):
+                    fence = None
+        self.is_v3 = any(l.strip() == MARKER and not self.in_code[i] for i, l in enumerate(self.lines))
+        self.headings = []
+        self.gates = []
+        for i, l in enumerate(self.lines):
+            if self.in_code[i]:
+                continue
+            h = _HEAD.match(l)
+            if h:
+                self.headings.append((i, len(h.group(1)), h.group(2)))
+            g = _GATE.match(l)
+            if g:
+                self.gates.append(Gate(i, g.group(1), g.group(2)))
+
+    def first(self, name):
+        for g in self.gates:
+            if g.name == name:
+                return g
+        return None
+
+    def section(self, name):
+        """[(heading line, start, end)] for every level-2 heading whose text starts with `name`."""
+        out = []
+        want = name.lower()
+        for k, (i, lvl, txt) in enumerate(self.headings):
+            if lvl != 2:
+                continue
+            t = re.sub(r"^\d+(\.\d+)*[.)]?\s+", "", txt).strip().lower()
+            if t.startswith(want):
+                end = next((j for (j, l2, _) in self.headings[k + 1:] if l2 <= 2), self.n)
+                out.append((i, i + 1, end))
+        return out
+
+    def items(self, s, e):
+        """Blocks in lines [s, e): top-level list items with their continuation and nested lines
+        ("item"), and loose non-list lines ("para"). -> [(line, kind, text)], inline code removed."""
+        lst = [i for i in range(s, e) if not self.in_code[i] and _LIST.match(self.lines[i])]
+        base = min(indent_of(self.lines[i]) for i in lst) if lst else 0
+        out, cur, gap = [], None, False
+        for i in range(s, e):
+            if self.in_code[i]:
+                continue
+            l = self.lines[i]
+            if not l.strip():
+                gap = True
+                continue
+            if _GATE.match(l) or _HEAD.match(l):
+                cur, gap = None, False
+                continue
+            m = _LIST.match(l)
+            if m and indent_of(l) <= base:
+                cur = [i, "item", strip_code(l)]
+                out.append(cur)
+            elif cur is not None and (not gap or indent_of(l) > base):
+                cur[2] += "\n" + strip_code(l)
+            else:
+                cur = None
+                out.append([i, "para", strip_code(l)])
+            gap = False
+        return [tuple(x) for x in out]
+
+    def status(self):
+        for i, l in enumerate(self.lines):
+            if self.in_code[i]:
+                continue
+            m = _STATUS.search(l)
+            if m:
+                v = re.split(r"\s·\s", m.group(1))[0]
+                return i, re.sub(r"\*+", "", v).strip()
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# Decision ids. An id is DEFINED by a list line in the Decisions section that starts with it
+# (`- D3 — …`, `- **D3** — …`, `` - `D3` — … ``, `- ~~D3 — …~~`). A range in a citation cites every id in it:
+# `D1..D3`, `` `D1`…`D4` ``, `D2 to D5`, and the same with a longer id scheme.
+# ════════════════════════════════════════════════════════════════════════════════════════
+_RANGE = re.compile(r"[`*_]*(?:\s*(?:\.\.|…)|\s+to\s)\s*[`*_]*\s*")
+_RANGE_END = re.compile(r"-?(\d+)(?![\w])")
+_DEFLINE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\*\*|\*|`|~~)*")   # a struck (withdrawn) decision is still defined
+_MAX_RANGE = 500
+
+
+def cited_ids(text, rx):
+    ids = set()
+    for m in rx.finditer(text):
+        a = m.group(0)
+        ids.add(a)
+        r = _RANGE.match(text, m.end())
+        ta = re.search(r"(\d+)$", a)
+        if not r or not ta:
+            continue
+        prefix, width, lo = a[:ta.start()], len(ta.group(1)), int(ta.group(1))
+        m2 = rx.match(text, r.end())
+        if m2:
+            tb = re.search(r"(\d+)$", m2.group(0))
+            if not tb or m2.group(0)[:tb.start()] != prefix:
+                continue
+            hi = int(tb.group(1))
+        else:
+            m3 = _RANGE_END.match(text, r.end())
+            if not m3:
+                continue
+            hi = int(m3.group(1))
+        if lo < hi <= lo + _MAX_RANGE:
+            for k in range(lo + 1, hi + 1):
+                ids.add(prefix + str(k).zfill(width))
+    return ids
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# The core rules (spec § 6). Each returns [(level, rule, line, message)]; line is 1-based,
+# 0 for the whole file.
+# ════════════════════════════════════════════════════════════════════════════════════════
+def rule_p2(plan):
+    out, seen, top = [], {}, None
+    for g in plan.gates:
+        if g.name not in GATES:
+            out.append(("ERROR", "P2", g.i + 1, "unknown gate 'Gate (%s)'; the gates are %s"
+                        % (g.name, ", ".join(GATES))))
+            continue
+        if g.name in seen:
+            out.append(("ERROR", "P2", g.i + 1, "Gate (%s) appears again (first at L%d); one line per gate"
+                        % (g.name, seen[g.name].i + 1)))
+            continue
+        seen[g.name] = g
+        if g.state is None:
+            out.append(("ERROR", "P2", g.i + 1, "Gate (%s): %r is not a state (%s · PARKED — re-entry: "
+                        "<trigger>; exposed: <what>)" % (g.name, short(g.text, 40), _VOCAB[g.name])))
+        if top is not None and GATES.index(g.name) < GATES.index(top.name):
+            out.append(("ERROR", "P2", g.i + 1, "Gate (%s) comes after Gate (%s) (L%d); the order is %s"
+                        % (g.name, top.name, top.i + 1, " → ".join(GATES))))
+        elif top is None or GATES.index(g.name) > GATES.index(top.name):
+            top = g
+    for name in GATES:
+        if name not in seen:
+            out.append(("ERROR", "P2", 0, "missing the 'Gate (%s):' line" % name))
+    return out
+
+
+def rule_p4(plan, cfg):
+    sm = cfg["status_map"]
+    if sm is None:
+        return []
+    st = plan.status()
+    at = st[0] + 1 if st else 0
+    firsts = [plan.first(n) for n in GATES]
+    if any(g is None or g.state is None for g in firsts):
+        return [("INFO", "P4", at, "not checked: the seven gate lines are not all valid (see P2)")]
+    phase = "intake"
+    for g in firsts:
+        if not g.pending:
+            phase = g.phase
+    if phase not in sm or sm[phase] is None:
+        return [("WARN", "P4", at, "the config's status_map has no %r key, so the plan cannot be judged "
+                 "(a config finding, not a plan error: %s)" % (phase, cfg["path"]))]
+    want = str(sm[phase])
+    if st is None:
+        return [("ERROR", "P4", 0, "the config has a status_map but the plan has no **Status:** line "
+                 "(the gates imply phase %s => %r)" % (phase, want))]
+    v = st[1]
+    if not (v == want or (v.startswith(want) and not re.match(r"[\w-]", v[len(want):len(want) + 1]))):
+        return [("ERROR", "P4", at, "**Status:** says %r, but the gates imply phase %s, which status_map "
+                 "maps to %r" % (short(v, 40), phase, want))]
+    return []
+
+
+def rule_p5(plan, cfg):
+    spec = plan.first("spec")
+    if spec is None or not re.search(r"open decisions:\s*none\b", spec.text.replace("*", ""), re.I):
+        return []
+    out = []
+    for _, s, e in plan.section("Recommendations"):
+        for i, _, text in plan.items(s, e):
+            if "⚑" in text and not cited_ids(text, cfg["id_re"]):
+                out.append(("ERROR", "P5", i + 1, "a ⚑ recommendation cites no decision id, but Gate (spec) "
+                            "(L%d) says 'open decisions: none'" % (spec.i + 1)))
+    return out
+
+
+def rule_p10(plan):
+    out = []
+    for _, s, e in plan.section("Definition of Done"):
+        for i, kind, text in plan.items(s, e):
+            if kind != "item":
+                continue
+            head = _LIST.sub("", text.split("\n")[0], count=1)
+            head = re.sub(r"^\[[ xX]\]\s*", "", head).lstrip("* ")
+            if head.startswith("~~"):
+                continue          # struck: not delivered, nothing to observe
+            if not re.search(r"observed by:", re.sub(r"[*_]", "", text), re.I):
+                out.append(("ERROR", "P10", i + 1, "a Definition of Done item has no 'observed by:'"))
+    return out
+
+
+def rule_p11(plan, cfg):
+    close = plan.first("close")
+    if close is None or close.state not in ("DONE", "ABANDONED"):
+        return []
+    out = []
+    for _, s, e in plan.section("Definition of Done"):
+        for i in range(s, e):
+            m = _BOX.match(plan.lines[i])
+            if not plan.in_code[i] and m and m.group(2) == " ":
+                out.append(("ERROR", "P11", i + 1, "Gate (close) is %s but this DoD box is open (an item not "
+                            "delivered is struck with no box: '- ~~item~~ — not delivered (why)')" % close.state))
+    tag = cfg["owner_tag"]
+    for _, s, e in plan.section("Steps"):
+        for i in range(s, e):
+            m = _BOX.match(plan.lines[i])
+            if plan.in_code[i] or not m or m.group(2) != " ":
+                continue
+            content = plan.lines[i][m.end():].strip().lstrip("*").lstrip()
+            if content.startswith(tag):
+                out.append(("INFO", "P11", i + 1, "an open owner step (%s) under Gate (close) %s: waiting on the "
+                            "owner, not drift" % (tag, close.state)))
+            else:
+                out.append(("WARN", "P11", i + 1, "an open step under Gate (close) %s" % close.state))
+    return out
+
+
+def rule_p12(plan, cfg):
+    rx = cfg["id_re"]
+    out, defined = [], {}
+    decisions = plan.section("Decisions")
+    for _, s, e in decisions:
+        for i in range(s, e):
+            if plan.in_code[i]:
+                continue
+            m = _DEFLINE.match(plan.lines[i])
+            m2 = rx.match(plan.lines[i], m.end()) if m else None
+            if not m2:
+                continue
+            d = m2.group(0)
+            if d in defined:
+                out.append(("ERROR", "P12", i + 1, "decision %s is defined twice (first at L%d)"
+                            % (d, defined[d] + 1)))
+            else:
+                defined[d] = i
+    if not decisions:
+        return out                # no Decisions section: the 'cited but undefined' half is skipped
+    for g in plan.gates:
+        missing = sorted(cited_ids(g.text, rx) - set(defined))
+        if missing:
+            out.append(("ERROR", "P12", g.i + 1, "Gate (%s) cites %s, which the Decisions section does not "
+                        "define" % (g.name, ", ".join(missing))))
+    return out
+
+
+def rule_p13(plan):
+    out, prev = [], -1
+    for g in plan.gates:
+        if not g.pending:
+            for i in range(prev + 1, g.i + 1):
+                if plan.in_code[i]:
+                    continue
+                ph = _PLACEHOLDER.findall(strip_code(plan.lines[i]))
+                if ph:
+                    out.append(("ERROR", "P13", i + 1, "placeholder %s left in a section Gate (%s) (L%d) has "
+                                "passed" % (", ".join(ph), g.name, g.i + 1)))
+        prev = g.i
+    return out
+
+
+def _split_row(line):
+    """Cells of a Markdown table row; '|' inside backticks or escaped does not split."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    cells, cur, tick, k = [], [], False, 0
+    while k < len(s):
+        c = s[k]
+        if c == "\\" and s[k + 1:k + 2] == "|":
+            cur.append("|")
+            k += 2
+            continue
+        if c == "`":
+            tick = not tick
+        if c == "|" and not tick:
+            cells.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        k += 1
+    cells.append("".join(cur))
+    return [c.strip() for c in cells]
+
+
+def _is_sep(cells):
+    return bool(cells) and all(re.match(r"^:?-{3,}:?$", c) for c in cells if c) and any(cells)
+
+
+def _meaningful(cell):
+    t = _PLACEHOLDER.sub("", cell)
+    return bool(t.strip(" *_`…—–-.\t"))
+
+
+def rule_p15(plan):
+    pg = plan.first("plan")
+    if pg is None or not pg.pending:
+        return []
+    out = []
+    b = plan.first("build")
+    if b is not None and not b.pending:
+        out.append(("ERROR", "P15", b.i + 1, "Gate (build) is %r while Gate (plan) (L%d) is pending: a build "
+                    "needs the plan's go" % (short(b.text, 30), pg.i + 1)))
+    for h, s, e in plan.section("Build log"):
+        sep = False
+        for i in range(s, e):
+            l = plan.lines[i].strip()
+            if plan.in_code[i] or not l.startswith("|"):
+                sep = False
+                continue
+            cells = _split_row(l)
+            if _is_sep(cells):
+                sep = True
+            elif sep and any(_meaningful(c) for c in cells):
+                out.append(("ERROR", "P15", h + 1, "the Build log has entries (L%d) while Gate (plan) (L%d) is "
+                            "pending" % (i + 1, pg.i + 1)))
+                break
+    return out
+
+
+_SIZE_SMALL = re.compile(r"\*\*Size:\*\*\s*\**\s*small\b", re.I)
+
+
+_DEPTH_ADV = re.compile(r"\*\*Depth:\*\*\s*\**\s*general\s*\+\s*adversarial", re.I)
+_PASSES = re.compile(r"^\s*\**\s*(\d+)\s+pass", re.I)
+
+
+def rule_p16(plan, nbytes):
+    """WARN: a plan that declares **Size:** small but breaks what small means (a size class kept honest, never a
+    gate): over the byte bound, an adversarial review depth (small = no adversarial trigger), or more than one
+    review pass (small = one general review).
+    Size and Depth are HEADER fields: only lines above the first `## ` heading count, so a log line that quotes
+    `**Size:** small` (or a depth) further down never reads as the plan's own class."""
+    head = next((i for i, l in enumerate(plan.lines) if l.startswith("## ")), len(plan.lines))
+    at = next((i for i, l in enumerate(plan.lines[:head]) if not plan.in_code[i] and _SIZE_SMALL.search(l)), None)
+    if at is None:
+        return []
+    out = []
+    if nbytes > SMALL_BYTES:
+        out.append(("WARN", "P16", at + 1, "**Size:** small, but the plan is %d bytes (small means <= %d): move the "
+                    "review log and long detail to sibling files, or re-class it and say so" % (nbytes, SMALL_BYTES)))
+    if any(not plan.in_code[i] and _DEPTH_ADV.search(l) for i, l in enumerate(plan.lines[:head])):
+        out.append(("WARN", "P16", at + 1, "**Size:** small, but the depth is general+adversarial: small means no "
+                    "adversarial trigger, so re-class it as standard and say so"))
+    rv = plan.first("review")
+    m = _PASSES.match(rv.text) if rv is not None else None
+    if m and int(m.group(1)) > 1:
+        out.append(("WARN", "P16", rv.i + 1, "**Size:** small, but Gate (review) records %s passes: small means one "
+                    "general review; re-class it as standard and say so" % m.group(1)))
+    return out
+
+
+def check_plan_text(text, cfg):
+    """-> (plan, findings). On a legacy plan every finding is downgraded to INFO."""
+    plan = Plan(text)
+    f = []
+    f += rule_p2(plan)
+    f += rule_p4(plan, cfg)
+    f += rule_p5(plan, cfg)
+    f += rule_p10(plan)
+    f += rule_p11(plan, cfg)
+    f += rule_p12(plan, cfg)
+    f += rule_p13(plan)
+    f += rule_p15(plan)
+    f += rule_p16(plan, len(text.encode("utf-8")))
+    if not plan.is_v3:
+        f = [("INFO", r, ln, m if lvl == "INFO" else "[legacy; %s in a v3 plan] %s" % (lvl, m))
+             for (lvl, r, ln, m) in f]
+    f.sort(key=lambda x: (x[2], RULE_ORDER.index(x[1]) if x[1] in RULE_ORDER else 99))
+    return plan, f
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# overlap: the build-time guard on the real branch diffs
+# ════════════════════════════════════════════════════════════════════════════════════════
+def _plain_cell(c):
+    return c.replace("`", "").replace("*", "").strip()
+
+
+def _norm_glob(g):
+    g = g.strip()
+    if g.startswith("./"):
+        g = g[2:]
+    if g.endswith("/"):
+        g += "*"
+    return g
+
+
+def parse_workstreams(plan):
+    """Rows of the first table whose header has a column starting 'Branch' and one starting
+    'Owned'. -> [(line, branch, [globs])], or None. Only backticked entries in the Owned cell are
+    globs; prose there and every other column are ignored."""
+    i = 0
+    while i < plan.n:
+        if plan.in_code[i] or not plan.lines[i].strip().startswith("|"):
+            i += 1
+            continue
+        head = _split_row(plan.lines[i])
+        bi = next((k for k, c in enumerate(head) if _plain_cell(c).startswith("Branch")), None)
+        oi = next((k for k, c in enumerate(head) if _plain_cell(c).startswith("Owned")), None)
+        j = i + 1
+        rows = []
+        while j < plan.n and not plan.in_code[j] and plan.lines[j].strip().startswith("|"):
+            cells = _split_row(plan.lines[j])
+            if bi is not None and oi is not None and not _is_sep(cells):
+                br = _plain_cell(cells[bi]) if bi < len(cells) else ""
+                owned = cells[oi] if oi < len(cells) else ""
+                globs = [_norm_glob(g) for g in re.findall(r"`([^`]+)`", owned) if g.strip()]
+                rows.append((j + 1, br, globs))
+            j += 1
+        if bi is not None and oi is not None:
+            return rows
+        i = j
+    return None
+
+
+def parse_hotspots(plan):
+    """The line starting 'Hotspots' (bold may wrap it): its backticked entries are repo-relative
+    globs. The list ends at ' · ' or at the next bold label. -> (line or 0, [globs])."""
+    for i, l in enumerate(plan.lines):
+        if plan.in_code[i]:
+            continue
+        m = re.match(r"^\s*(?:\*\*)?Hotspots\b[^:]*:(?:\*\*)?(.*)$", l)
+        if m:
+            rest = m.group(1)
+            cut = re.search(r"\s·\s|\*\*[A-Z][^*]*:\*\*", rest)
+            if cut:
+                rest = rest[:cut.start()]
+            return i + 1, [_norm_glob(g) for g in re.findall(r"`([^`]+)`", rest) if g.strip()]
+    return 0, []
+
+
+def select_row(rows, branch):
+    hits = [r for r in rows if r[1] == branch]
+    if len(hits) != 1:
+        where = ", ".join("L%d" % r[0] for r in hits) or "none"
+        raise CheckError("overlap", hits[0][0] if hits else 0,
+                         "branch %r matches %d Workstreams rows (%s): ambiguous, so nothing was checked"
+                         % (branch, len(hits), where))
+    return hits[0]
+
+
+def overlap_findings(diffs, order, rows=None, hot_line=0, hotspots=()):
+    """diffs: branch -> changed files. rows: branch -> (line, branch, globs) when --plan is given."""
+    out = []
+    by_file = {}
+    for b in order:
+        for f in diffs[b]:
+            by_file.setdefault(f, []).append(b)
+    for f in sorted(by_file):
+        if len(by_file[f]) > 1:
+            out.append(("ERROR", "overlap", 0, "%s is changed by %s" % (f, " and ".join(by_file[f]))))
+    if rows is not None:
+        for b in order:
+            line, _, globs = rows[b]
+            for f in diffs[b]:
+                if not any(fnmatch.fnmatchcase(f, g) for g in globs):
+                    out.append(("ERROR", "overlap", line, "%s changed %s, outside its owned globs (%s)"
+                                % (b, f, ", ".join(globs) or "none")))
+                hot = [g for g in hotspots if fnmatch.fnmatchcase(f, g)]
+                if hot:
+                    out.append(("ERROR", "overlap", hot_line, "%s changed %s, a hotspot (%s): orchestrator only"
+                                % (b, f, hot[0])))
+    return out
+
+
+def _git(args):
+    try:
+        p = subprocess.run(["git"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        raise CheckError("overlap", 0, "cannot run git (%s)" % e)
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise CheckError("overlap", 0, "git %s failed (rc %d): %s"
+                         % (" ".join(args), p.returncode, err[-1] if err else ""))
+    return p.stdout
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# P0: the embedded control. Every run first checks these planted inputs and must get exactly
+# the expected findings; if it cannot, the script is broken and the run exits 2.
+# ════════════════════════════════════════════════════════════════════════════════════════
+_CONTROL_PLAN = r"""<!-- pm-template: v3 -->
+# PLANTED: the pm-check control plan
+
+**Priority:** n/a · **Status:** in-progress · **Updated:** 1970-01-01
+
+## Origin
+> planted
+
+Gate (intake): captured
+
+## Value
+Quiet: `{{inside inline code}}`.
+
+Gate (value): **SPIKE-FIRST** — D1
+
+## Decisions (owner)
+- D1 — planted
+- **D2** — planted
+- D2 — planted a second time
+
+## Recommendations (Claude — not decisions)
+- ⚑ planted, answered by D1
+- ⚑ planted, answered by nobody
+
+## Definition of Done
+- [x] planted — **observed by:** a read
+- [ ] planted open box — **observed by:** a read
+- [x] planted with no observation
+- [x] planted, wrapped
+  — **observed by:** the next line
+- ~~planted~~ — not delivered (struck, no box)
+
+Gate (spec): drafted — open decisions: none
+
+## Review
+{{left behind}}
+```
+{{fenced}}
+```
+
+Gate (review): 1 pass — D1..D3
+
+## Steps
+- [ ] **[O]** planted owner step
+- [ ] **[C]** planted step
+{{later}}
+
+Gate (plan): pending go-ahead
+
+## Build log
+
+Gate (build): in progress
+
+## Close
+
+Gate (close): DONE
+Gate (bogus): planted
+"""
+_CONTROL_EXPECT = [
+    ("ERROR", "P4", 4),
+    ("ERROR", "P12", 19),
+    ("ERROR", "P5", 23),
+    ("ERROR", "P11", 27),
+    ("ERROR", "P10", 28),
+    ("ERROR", "P13", 36),
+    ("ERROR", "P12", 41),
+    ("INFO", "P11", 44),
+    ("WARN", "P11", 45),
+    ("ERROR", "P15", 52),
+    ("ERROR", "P2", 57),
+]
+_CONTROL_CONFIG = r"""# planted config
+```yaml
+owner: "planted: a colon inside quotes"   # a comment
+status_map: {intake: not-started, spec: in-progress, closed: "done"}
+step_tags:
+  owner: "[O]"
+  claude: '[C]'
+hotspots:
+  - a/b.md
+  - "c: d.md"   # comment
+id_scheme: 'D\d+'
+empty: null
+```
+"""
+_CONTROL_CONFIG_DATA = {
+    "owner": "planted: a colon inside quotes",
+    "status_map": {"intake": "not-started", "spec": "in-progress", "closed": "done"},
+    "step_tags": {"owner": "[O]", "claude": "[C]"},
+    "hotspots": ["a/b.md", "c: d.md"],
+    "id_scheme": "D\\d+",
+    "empty": None,
+}
+_CONTROL_CONFIG_BAD = ("```yaml\nowner: x\nstep_tags:\n  owner: \"[O]\"\nbad: a: b\n```\n", 5)
+_CONTROL_STATES = [
+    ("value", "**GO** — D1", "GO"),
+    ("value", "NO-GO — too costly", "NO-GO"),
+    ("value", "GOOD", None),
+    ("plan", "go (wave 1 only) — D2", "go (scope)"),
+    ("plan", "pending go-ahead", "pending go-ahead"),
+    ("review", "3 passes, 9 findings", "passes"),
+    ("build", "built, awaiting owner observation — the card", "built, awaiting owner observation"),
+    ("build", "not started — PARKED", None),
+    ("close", "PARKED — re-entry: spring; exposed: the beds", "PARKED"),
+    ("close", "PARKED — waiting", None),
+    ("close", "done", None),
+]
+_CONTROL_RANGES = [
+    (r"D-\d+", "`D-01`…`-03`", ["D-01", "D-02", "D-03"]),
+    (r"D-\d+", "D-44 to -46", ["D-44", "D-45", "D-46"]),
+    (r"D\d+", "D1..D3, D7", ["D1", "D2", "D3", "D7"]),
+]
+_CONTROL_OVERLAP_PLAN = r"""## Workstreams
+| Stream | Mode | Wave | Branch | Owned (globs) | Notes |
+|---|---|---|---|---|---|
+| S-1 | subagent | 1 | `c-one` | `src/a/*`, prose is ignored, `docs/a.md` | `src/b/*` here is ignored |
+| S-2 | subagent | 1 | `c-two` | `src/b/*`, `shared/*.md` | |
+| S-3 | main | 2 | `c-dup` | `x/*` | |
+| S-4 | main | 2 | `c-dup` | `y/*` | |
+
+**Hotspots:** `shared/hot.md` · Merge order: S-1, then S-2 `not/a/hotspot.md`
+"""
+_CONTROL_OVERLAP_DIFFS = {
+    "c-one": ["docs/a.md", "src/a/x.py", "src/b/y.py"],
+    "c-two": ["shared/hot.md", "shared/ok.md", "src/b/y.py"],
+}
+_CONTROL_OVERLAP_EXPECT = [
+    (0, "pair", "src/b/y.py"),
+    (4, "outside", "src/b/y.py"),
+    (9, "hotspot", "shared/hot.md"),
+]
+
+
+def _control_overlap():
+    problems = []
+    plan = Plan(_CONTROL_OVERLAP_PLAN)
+    rows = parse_workstreams(plan)
+    hot_line, hot = parse_hotspots(plan)
+    if hot != ["shared/hot.md"]:
+        problems.append("Hotspots line read as %r" % (hot,))
+    sel = {b: select_row(rows or [], b) for b in ("c-one", "c-two")}
+    for b in ("c-dup", "c-none"):
+        try:
+            select_row(rows or [], b)
+            problems.append("branch %s was not refused as ambiguous" % b)
+        except CheckError:
+            pass
+    got = overlap_findings(_CONTROL_OVERLAP_DIFFS, ["c-one", "c-two"], sel, hot_line, hot)
+    kinds = {"pair": "is changed by", "outside": "outside its owned globs", "hotspot": "a hotspot"}
+    want = sorted(_CONTROL_OVERLAP_EXPECT)
+    have = []
+    for _, _, line, msg in got:
+        kind = next((k for k, v in kinds.items() if v in msg), "?")
+        path = next((p for p in ("src/b/y.py", "shared/hot.md", "shared/ok.md", "docs/a.md", "src/a/x.py")
+                     if p in msg), "?")
+        have.append((line, kind, path))
+    if sorted(have) != want:
+        problems.append("overlap on the planted diffs: expected %s, got %s" % (want, sorted(have)))
+    return problems
+
+
+def run_control(overlap=False):
+    """-> [problem, ...]; empty means the control passed."""
+    problems = []
+    try:
+        data, where = parse_config(_CONTROL_CONFIG, "<control config>")
+        if data != _CONTROL_CONFIG_DATA:
+            problems.append("config subset parsed as %r" % (data,))
+        cfg = config_fields(data, where, "<control config>")
+        bad, bad_line = _CONTROL_CONFIG_BAD
+        try:
+            parse_config(bad, "<control config>")
+            problems.append("an unparseable config line was accepted")
+        except CheckError as e:
+            if e.line != bad_line:
+                problems.append("the unparseable config line was reported at L%d, not L%d" % (e.line, bad_line))
+        for name, text, want in _CONTROL_STATES:
+            got = gate_state(name, text)[0]
+            if got != want:
+                problems.append("Gate (%s): %r read as %r, not %r" % (name, text, got, want))
+        for scheme, text, want in _CONTROL_RANGES:
+            rx = re.compile(r"(?<![\w])(?:%s)(?![\w])" % scheme)
+            got = sorted(cited_ids(text, rx))
+            if got != sorted(want):
+                problems.append("ids in %r read as %s" % (text, got))
+        want = sorted(_CONTROL_EXPECT, key=lambda x: (x[2], x[1], x[0]))
+        _, f = check_plan_text(_CONTROL_PLAN, cfg)
+        got = sorted(((lv, r, ln) for lv, r, ln, _ in f), key=lambda x: (x[2], x[1], x[0]))
+        if got != want:
+            problems.append("planted plan: missing %s; unexpected %s"
+                            % (sorted(set(want) - set(got)) or "none", sorted(set(got) - set(want)) or "none"))
+        small = MARKER + "\n**Size:** small\n"
+        pad = SMALL_BYTES - len(small.encode("utf-8"))
+        for extra, want16 in ((pad, []), (pad + 1, [("WARN", "P16", 2)])):
+            _, f = check_plan_text(small + "x" * extra, cfg)
+            got16 = [(lv, r, ln) for lv, r, ln, _ in f if r == "P16"]
+            if got16 != want16:
+                problems.append("P16 on a small plan of %d bytes: expected %s, got %s"
+                                % (len(small) + extra, want16, got16))
+        for body, want16 in (("**Depth:** general+adversarial\n", [("WARN", "P16", 2)]),
+                             ("Gate (review): 2 passes, 3 findings, 0 open\n", [("WARN", "P16", 2)]),
+                             ("**Depth:** general\nGate (review): 1 pass, 3 findings, 0 open\n", [])):
+            _, f = check_plan_text(small + body, cfg)
+            got16 = [(lv, r, 2) for lv, r, ln, _ in f if r == "P16"]
+            if got16 != want16:
+                problems.append("P16 on a small plan with %r: expected %s, got %s" % (body.strip(), want16, got16))
+        legacy = _CONTROL_PLAN.replace(MARKER, "<!-- planted legacy copy -->", 1)
+        _, f = check_plan_text(legacy, cfg)
+        got = sorted(((lv, r, ln) for lv, r, ln, _ in f), key=lambda x: (x[2], x[1], x[0]))
+        if got != sorted((("INFO", r, ln) for _, r, ln in want), key=lambda x: (x[2], x[1], x[0])):
+            problems.append("the legacy copy of the planted plan did not give the same findings as INFO only")
+        if overlap:
+            problems += _control_overlap()
+    except Exception as e:  # the control's own crash must never read as a pass
+        problems.append("the control itself crashed (%r)" % (e,))
+    return problems
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# Command line
+# ════════════════════════════════════════════════════════════════════════════════════════
+def emit(level, rule, line, msg):
+    print("%s %s L%d: %s" % (level, rule, line, " ".join(str(msg).split())))
+
+
+def control_or_exit(overlap=False):
+    problems = run_control(overlap)
+    if problems:
+        emit("ERROR", "P0", 0, "CONTROL FAILED: " + "; ".join(problems) + " — pm-check is broken, so this run "
+             "proves nothing (exit 2)")
+        return False
+    return True
+
+
+def read_text(path, what):
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as e:
+        raise CheckError(what, 0, "%s: cannot read (%s)" % (path, e.strerror or e))
+    if b"\0" in raw:
+        raise CheckError(what, 0, "%s: holds a NUL byte (binary, not a plan)" % path)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise CheckError(what, 0, "%s: not UTF-8 (%s)" % (path, e))
+
+
+def cmd_check(argv):
+    ap = argparse.ArgumentParser(prog="pm-check", description="Shape checks for a /project-management plan. "
+                                 "Also: pm-check overlap --base <sha> <branch>... [--plan <plan.md>]")
+    ap.add_argument("plan", help="the plan file")
+    ap.add_argument("--config", help="pm.config.md (default: the nearest one walking up from the plan)")
+    ap.add_argument("--today", help="YYYY-MM-DD (accepted for the date rules; no core rule reads it)")
+    a = ap.parse_args(argv)
+    if a.today is not None:
+        try:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
+                raise ValueError
+            datetime.datetime.strptime(a.today, "%Y-%m-%d")
+        except ValueError:
+            raise CheckError("input", 0, "--today %r is not a YYYY-MM-DD date" % a.today)
+    if not control_or_exit():
+        return 2
+    text = read_text(a.plan, "input")
+    cfg_path = a.config if a.config is not None else find_config(a.plan)
+    cfg = load_config(cfg_path) if cfg_path else default_config()
+    plan, findings = check_plan_text(text, cfg)
+    emit("INFO", "P0", 0, "embedded control passed (%d planted findings, legacy copy INFO-only, config subset, "
+         "gate grammar, id ranges, the small-size bound)" % len(_CONTROL_EXPECT))
+    emit("INFO", "config", 0, "config: %s" % (cfg_path or "none found; defaults (no status_map, owner tag [O], "
+                                              "ids D<n>)"))
+    if not plan.is_v3:
+        emit("INFO", "legacy", 0, "no '%s' line: a legacy plan, so every finding is INFO and the exit code is 0"
+             % MARKER)
+    for f in findings:
+        emit(*f)
+    return 1 if any(f[0] in ("ERROR", "WARN") for f in findings) else 0
+
+
+def cmd_overlap(argv):
+    ap = argparse.ArgumentParser(prog="pm-check overlap",
+                                 description="Files touched by more than one named branch since --base "
+                                 "(git diff --name-only <base>...<branch>); with --plan, also files a branch "
+                                 "touched outside its Workstreams row's owned globs, and hotspot files.")
+    ap.add_argument("--base", required=True, help="the base commit the branches started from")
+    ap.add_argument("--plan", help="the plan whose Workstreams table and Hotspots line to read")
+    ap.add_argument("branches", nargs="+", help="stream branches (never the orchestrator's own)")
+    a = ap.parse_args(argv)
+    if not control_or_exit(overlap=True):
+        return 2
+    for name in [a.base] + a.branches:
+        if name.startswith("-"):
+            raise CheckError("overlap", 0, "%r starts with '-'; refusing to pass it to git" % name)
+    if _git(["rev-parse", "--is-inside-work-tree"]).strip() != b"true":
+        raise CheckError("overlap", 0, "not inside a git work tree")
+    for name in [a.base] + a.branches:
+        _git(["rev-parse", "--verify", "--quiet", name + "^{commit}"])
+    if len(set(a.branches)) != len(a.branches):
+        raise CheckError("overlap", 0, "a branch is named twice")
+    rows = hot_line = None
+    hotspots = []
+    if a.plan:
+        plan = Plan(read_text(a.plan, "input"))
+        table = parse_workstreams(plan)
+        if table is None:
+            raise CheckError("overlap", 0, "%s: no table with a 'Branch…' and an 'Owned…' column" % a.plan)
+        rows = {b: select_row(table, b) for b in a.branches}
+        hot_line, hotspots = parse_hotspots(plan)
+    diffs = {}
+    for b in a.branches:
+        out = _git(["diff", "--name-only", "-z", "--no-renames", "%s...%s" % (a.base, b), "--"])
+        diffs[b] = sorted(set(x.decode("utf-8", "surrogateescape") for x in out.split(b"\0") if x))
+    emit("INFO", "P0", 0, "embedded control passed (planted plan, config, gate grammar, id ranges, overlap)")
+    for b in a.branches:
+        emit("INFO", "overlap", rows[b][0] if rows else 0, "%s: %d file(s) changed since %s"
+             % (b, len(diffs[b]), a.base))
+    if a.plan:
+        emit("INFO", "overlap", hot_line, "hotspots: %s" % (", ".join(hotspots) or "none found"))
+    findings = overlap_findings(diffs, a.branches, rows, hot_line or 0, hotspots)
+    for f in findings:
+        emit(*f)
+    return 1 if findings else 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except Exception:
+        pass
+    try:
+        if argv and argv[0] == "overlap":
+            return cmd_overlap(argv[1:])
+        return cmd_check(argv)
+    except CheckError as e:
+        emit("ERROR", e.where, e.line, e.msg)
+        return 2
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        emit("ERROR", "internal", 0, "pm-check crashed, so nothing was checked (exit 2)")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

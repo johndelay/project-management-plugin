@@ -1,0 +1,156 @@
+<!-- TEMPLATE: the decisions page — the standard way to ask the owner a round of questions.
+How to use it:
+ 1. Copy this file and fill in every {{…}}. Use it only if you can publish a page the owner can open; otherwise use decisions.md.
+ 2. Add one <article class="q"> per question, with input name="qN" and values a/b/c…. Put the recommended choice first, carrying the "Recommended" pill.
+ 3. Number the questions EXACTLY as the plan does, and list each one in the script's `order` array.
+ 4. Each question says: what it is in plain words · what it blocks · which plan steps its answer moves · why it's the owner's call · each choice and what it does · the recommendation.
+ 5. Publish it with your page tool and give the owner the link. When the answers come back (e.g. "1a 2b"), record each one as a decision id, add the "Answered" strip, and republish the same file path.
+Keep: the CSS tokens (light and dark), the sticky copy-reply bar (it falls back to selecting the text when the clipboard is blocked), and the wrapped localStorage. -->
+<title>{{Topic}} Decisions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,750&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; each question is a ruled block with its choices as a selectable list; a sticky reply bar collects picks. */
+:root{
+  --bg:#f5f6f3; --surface:#ffffff; --ink:#1b211d; --muted:#5b655e; --rule:#d9ddd6;
+  --accent:#1f6f5c; --accent-soft:#e3f0ec; --rec:#8a5a00; --rec-soft:#fbf0d9; --warn:#a33b2b; --warn-soft:#f8e6e2;
+  --font-display:"Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --font-body:"IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#111613; --surface:#18201b; --ink:#e7ece8; --muted:#a3ada6; --rule:#2c3530;
+  --accent:#5cc3a6; --accent-soft:#16302a; --rec:#f0bf5a; --rec-soft:#33280f; --warn:#f08a78; --warn-soft:#3a1c17; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#111613; --surface:#18201b; --ink:#e7ece8; --muted:#a3ada6; --rule:#2c3530;
+  --accent:#5cc3a6; --accent-soft:#16302a; --rec:#f0bf5a; --rec-soft:#33280f; --warn:#f08a78; --warn-soft:#3a1c17; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg); color:var(--ink); font:16px/1.55 var(--font-body); margin:0}
+.wrap{max-width:760px; margin:0 auto; padding-inline:16px; padding-block:28px 120px}
+h1,h2,h3{font-family:var(--font-display); text-wrap:balance; line-height:1.15; margin:0}
+h1{font-size:clamp(1.9rem,4.5vw,2.6rem); font-weight:750; letter-spacing:-.01em}
+.dek{color:var(--muted); margin:.6rem 0 0; max-width:62ch}
+.systems{display:flex; flex-wrap:wrap; gap:8px; margin:1rem 0 0}
+.system{font:500 .78rem var(--font-mono); letter-spacing:.04em; text-transform:uppercase; padding:4px 9px; border:1px solid var(--rule); border-radius:999px; color:var(--muted); background:var(--surface)}
+section.brief{margin-top:2rem; padding:18px 20px; background:var(--surface); border:1px solid var(--rule); border-radius:10px}
+section.brief h2{font-size:1.15rem; margin-bottom:.6rem}
+.brief ul{margin:0; padding-left:1.1rem; display:grid; gap:.45rem}
+.brief li{max-width:65ch}
+.flag{background:var(--warn-soft); border-left:3px solid var(--warn); padding:10px 14px; border-radius:6px; margin-top:12px}
+.flag strong{color:var(--warn)}
+.howto{margin-top:2rem; color:var(--muted); font-size:.95rem}
+.q{margin-top:2.4rem; padding-top:1.4rem; border-top:1px solid var(--rule)}
+.q header{display:flex; gap:12px; align-items:baseline}
+.qn{font:500 .9rem var(--font-mono); color:var(--accent); min-width:2.2rem}
+.q h3{font-size:1.35rem; font-weight:750}
+.q p{margin:.55rem 0 0; max-width:65ch}
+.label{font:600 .72rem var(--font-body); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-top:1rem; display:block}
+.choices{list-style:none; margin:.6rem 0 0; padding:0; display:grid; gap:8px}
+.choice{display:grid; grid-template-columns:auto 1fr; gap:12px; align-items:start; padding:12px 14px; border:1px solid var(--rule); border-radius:8px; background:var(--surface); cursor:pointer}
+.choice:hover{border-color:var(--accent)}
+.choice input{margin:.3rem 0 0; accent-color:var(--accent); width:1.05rem; height:1.05rem}
+.choice:has(input:checked){border-color:var(--accent); background:var(--accent-soft)}
+.choice:has(input:focus-visible){outline:2px solid var(--accent); outline-offset:2px}
+.ctext{min-width:0}
+.cid{font:500 .85rem var(--font-mono); color:var(--accent); margin-right:.35rem}
+.ctitle{font-weight:600}
+.cbody{display:block; color:var(--muted); font-size:.94rem; margin-top:.2rem}
+.pill{display:inline-block; font:600 .68rem var(--font-body); letter-spacing:.06em; text-transform:uppercase; color:var(--rec); background:var(--rec-soft); padding:2px 7px; border-radius:999px; margin-left:.4rem; vertical-align:2px}
+.why{font-size:.94rem}
+.done{margin-top:3rem; padding-top:1.2rem; border-top:1px solid var(--rule)}
+.done h2{font-size:1.15rem}
+.done dl{display:grid; grid-template-columns:minmax(8rem,auto) 1fr; gap:.5rem 1rem; margin:.8rem 0 0}
+.done dt{font-weight:600}
+.done dd{margin:0; color:var(--muted); min-width:0}
+.files{font:400 .85rem var(--font-mono); color:var(--muted); overflow-wrap:anywhere}
+.bar{position:fixed; left:0; right:0; bottom:0; background:var(--surface); border-top:1px solid var(--rule); padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px))}
+.bar .in{max-width:760px; margin:0 auto; display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+.bar code{font:500 .95rem var(--font-mono); background:var(--bg); border:1px solid var(--rule); padding:6px 10px; border-radius:6px; flex:1 1 14rem; min-width:0; overflow-x:auto; white-space:nowrap}
+.bar button{font:600 .9rem var(--font-body); background:var(--accent); color:var(--surface); border:0; border-radius:6px; padding:8px 14px; cursor:pointer}
+.bar button:focus-visible{outline:2px solid var(--ink); outline-offset:2px}
+.bar .msg{font-size:.85rem; color:var(--muted)}
+@media (max-width:520px){.done dl{grid-template-columns:1fr}.done dt{margin-top:.4rem}}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <h1>{{Topic}}: {{N}} calls for you</h1>
+  <p class="dek">{{One or two sentences: what was planned or found. Each question lists the recommended choice first.}}</p>
+  <div class="systems"><span class="system">{{system 1}}</span><span class="system">{{system 2}}</span></div>
+
+  <section class="brief">
+    <h2>What we found</h2>
+    <ul>
+      <li><strong>{{Headline finding.}}</strong> {{Why it matters, in plain words.}}</li>
+    </ul>
+    <div class="flag"><strong>{{Optional warning:}}</strong> {{something to avoid until a fix ships.}}</div>
+  </section>
+
+  <!-- AFTER THE OWNER ANSWERS, add this strip here and republish the same file path:
+  <div class="flag" style="border-left-color:var(--accent);background:var(--accent-soft)"><strong style="color:var(--accent)">Answered {{date}}: {{1a 2b}}.</strong> Recorded as {{decision ids}}. Next: {{…}}.</div> -->
+  <p class="howto">Pick an answer under each question. The bar at the bottom builds a one-line reply (like <code>1a 2a</code>) to paste back, and names any question still unanswered. Add any note in your own words.</p>
+
+  <form id="qs" onsubmit="return false">
+  <article class="q" id="q1">
+    <header><span class="qn">Q1</span><h3>{{Question 1, asked as a plain question?}}</h3></header>
+    <p>{{What it is, in plain words. No internal ids without a gloss.}}</p>
+    <p class="why"><span class="label">Blocks</span>{{What cannot start until this is answered.}}</p>
+    <p class="why"><span class="label">Moves these steps</span>{{Which plan steps an answer adds, removes or reorders — or "none".}}</p>
+    <p class="why"><span class="label">Why it's yours</span>{{Why the owner decides this, not the agent.}}</p>
+    <ul class="choices">
+      <li><label class="choice"><input type="radio" name="q1" value="a"><span class="ctext"><span class="cid">1a</span><span class="ctitle">{{The recommended choice, first.}}</span><span class="pill">Recommended</span><span class="cbody">{{What happens if chosen.}}</span></span></label></li>
+      <li><label class="choice"><input type="radio" name="q1" value="b"><span class="ctext"><span class="cid">1b</span><span class="ctitle">{{An alternative.}}</span><span class="cbody">{{What happens if chosen.}}</span></span></label></li>
+    </ul>
+  </article>
+  <article class="q" id="q2">
+    <header><span class="qn">Q2</span><h3>{{Question 2, asked as a plain question?}}</h3></header>
+    <p>{{What it is, in plain words. No internal ids without a gloss.}}</p>
+    <p class="why"><span class="label">Blocks</span>{{What cannot start until this is answered.}}</p>
+    <p class="why"><span class="label">Moves these steps</span>{{Which plan steps an answer adds, removes or reorders — or "none".}}</p>
+    <p class="why"><span class="label">Why it's yours</span>{{Why the owner decides this, not the agent.}}</p>
+    <ul class="choices">
+      <li><label class="choice"><input type="radio" name="q2" value="a"><span class="ctext"><span class="cid">2a</span><span class="ctitle">{{The recommended choice, first.}}</span><span class="pill">Recommended</span><span class="cbody">{{What happens if chosen.}}</span></span></label></li>
+      <li><label class="choice"><input type="radio" name="q2" value="b"><span class="ctext"><span class="cid">2b</span><span class="ctitle">{{An alternative.}}</span><span class="cbody">{{What happens if chosen.}}</span></span></label></li>
+    </ul>
+  </article>
+  </form>
+
+  <section class="done">
+    <h2>Already decided or handled</h2>
+    <dl>
+      <dt>{{Item}}</dt><dd>{{What was decided and by whom, or why it isn't a question.}}</dd>
+    </dl>
+  </section>
+</div>
+
+<div class="bar" role="region" aria-label="Your reply">
+  <div class="in">
+    <code id="reply">pick an answer above</code>
+    <button type="button" id="copy">Copy reply</button>
+    <span class="msg" id="msg" aria-live="polite"></span>
+  </div>
+</div>
+
+<script>
+(function(){
+  var KEY='{{topic}}-picks';
+  var form=document.getElementById('qs'), out=document.getElementById('reply'), msg=document.getElementById('msg');
+  var order=[['q1','1'],['q2','2']]; /* [input name, number shown]: one row per question, in page order */
+  function read(){var picks={};order.forEach(function(o){var el=form.querySelector('input[name="'+o[0]+'"]:checked');if(el)picks[o[0]]=el.value;});return picks;}
+  function render(){var p=read();var parts=order.filter(function(o){return p[o[0]];}).map(function(o){return o[1]+p[o[0]];});
+    var open=order.filter(function(o){return !p[o[0]];}).map(function(o){return 'Q'+o[1];}); /* a skipped question is named, never silently dropped */
+    out.textContent=parts.length?parts.join(' ')+(open.length?' (unanswered: '+open.join(', ')+')':''):'pick an answer above';
+    msg.textContent=open.length&&parts.length?open.join(', ')+(open.length>1?' are':' is')+' unanswered.':'';
+    try{localStorage.setItem(KEY,JSON.stringify(p));}catch(e){}}
+  try{var saved=JSON.parse(localStorage.getItem(KEY)||'{}');Object.keys(saved).forEach(function(k){var el=form.querySelector('input[name="'+k+'"][value="'+saved[k]+'"]');if(el)el.checked=true;});}catch(e){}
+  form.addEventListener('change',render); render();
+  document.getElementById('copy').addEventListener('click',function(){
+    var t=out.textContent;
+    if(!/\d[a-d]/.test(t)){msg.textContent='Pick at least one answer first.';return;}
+    var done=function(){msg.textContent='Copied.';};
+    var fallback=function(){var r=document.createRange();r.selectNodeContents(out);var s=getSelection();s.removeAllRanges();s.addRange(r);msg.textContent='Selected — press copy.';};
+    try{navigator.clipboard.writeText(t).then(done,fallback);}catch(e){fallback();}
+  });
+})();
+</script>
