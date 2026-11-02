@@ -5,6 +5,14 @@ of the public history, made by hand, and gets the same checks before it is pushe
 every commit and tag for terms that must not be published (after a planted term proves it can hit), the identity check, the install test in an empty
 home directory, and two clean review passes of what ships.
 
+## README revision after 3.0.0 (docs only; the `project-management--v3.0.0` tag predates it)
+
+- The `CLAUDE.md` opt-in line for plain feature requests is narrower: new features, new projects and builds that span
+  sessions, not routine ops, config changes, fixes or investigations. The broad first version started the skill on a
+  three-file ops move (2 of 3 runs) and the agent then edited without a plan; the narrower one did not start the skill
+  there (0 of 3). Measured on one ops task and one small config edit; fixes and investigations were not tested. Numbers in the README (E11, E12).
+  No skill or checker change.
+
 ## 3.0.0
 
 The first public release.

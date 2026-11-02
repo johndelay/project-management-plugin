@@ -76,12 +76,25 @@ small request through a seven-phase process. To make it start on feature request
 project's `CLAUDE.md` (or your agent's equivalent instructions file):
 
 ```
-For any feature or change bigger than a one-line fix with no plan yet, use the project-management skill.
+For a new feature, a new project, or a build that will span sessions, with no plan yet, use the
+project-management skill. Not for routine ops, config changes, fixes or investigations, and not when
+the user says to just do it.
 ```
 
 Measured on Sonnet, 3 runs each, same repository and same request with no planning words (eval E10 and its baseline
-E10b): **with the line, the skill started 3 of 3 times** and nothing was built before it asked its questions; **without
-it, 0 of 3**, and the agent built the feature every time.
+E10b): **with an opt-in line, the skill started 3 of 3 times** and nothing was built before it asked its questions;
+**without one, 0 of 3**, and the agent built the feature every time. E10 used the first, broad line, and the suite's E10
+fixture still does.
+
+The line above, word for word, is the narrower of two versions tested. The first said "any feature or change bigger than
+a one-line fix", and on one ops task it proved too broad. Also on Sonnet, 3 runs each:
+
+- **A feature request** (the same request to export a reading list to CSV): the line above started the skill 3 of 3 times and nothing was built (E11).
+- **A small config change** (two values in one compose file): 0 of 3 under either line; the agent made the edit (E11b,
+  E11c). This request did not separate the two lines.
+- **A three-file ops move** (one service moved between two hosts: placement, a DNS record, a monitoring target): the
+  line above, 0 of 3. The broad line started the skill in 2 of 3 runs, and both times the agent then made the edits
+  straight away, with no plan and no gate lines (E12, E12b).
 
 **Running headless (`claude -p`).** On Claude Code 2.1.316, a headless run in a folder the CLI has not been told to trust
 was denied every write. Pass the folder and the tools explicitly:
@@ -184,7 +197,9 @@ scaffolded repository):
 | E10 optin-plain-request | trigger | a plain feature request in a project whose `CLAUDE.md` has the opt-in line: the skill starts and nothing is built first |
 | E10b plain-request-baseline | trigger | the same request without the line: the baseline (the skill is not expected to start) |
 
-E1–E5 and E7–E9 carry the tag `main`, E6 `no-agents`, and E10/E10b `optin`.
+E1–E5 and E7–E9 carry the tag `main`, E6 `no-agents`, and E10/E10b `optin`. E11, E11b, E11c, E12 and E12b (the narrower
+opt-in line on a feature request, a small config change and a three-file ops move; see the opt-in section above) were
+one-off runs on Sonnet; they are not in this suite and cannot be re-run from this repository.
 
 E1 is labelled *adherence*: it scores whether the skill's own format was followed. A run without the skill is not expected
 to write gate lines, so E1 shows that the skill is followed, not that it plans better. The outcome cases are the ones that
@@ -211,14 +226,15 @@ Opus. On Haiku two did not: E8's "close not marked done" passed 2 of 3, and E9's
 1 of 3, because Haiku did not load the skill at all on E9. The bar set before the runs (outcome cases score higher with
 the skill wherever there is headroom, safety checks pass, the trigger cases fire as expected) was met on Sonnet and Opus
 and not on Haiku; Haiku's results are reported, not used as the bar. E10 ran on Sonnet only, without the no-plugin arm
-(the comparison there is line versus no line): 3 of 3 started with the line, 0 of 3 without.
+(the comparison there is line versus no line): 3 of 3 started with the line, 0 of 3 without. E11–E12 also ran on Sonnet
+only, and compared the narrower line with the first, broad one (E11 against the earlier E10).
 
 *Which text the runs used.* Opus and Haiku ran every case on the released skill text. On Sonnet, E4 and E9 ran on the
 released text and the other cases on the text before two late edits to the checkpoint rules (how a "go ahead" is read
 while a question is open, and answers given before a checkpoint). Two changes came after every eval and stranger run, and
 neither was re-run: the small-plan rules (the `pm-check` warnings above and a note that a small plan stops for you only
 twice) and naming the review log through the `review_naming` setting. Cost: about $9 on Sonnet, $31 on Opus and $1.40 on Haiku for the
-main runs, plus $0.84 for E10.
+main runs, plus $0.84 for E10 and $1.24 for E11, E11b, E11c, E12 and E12b.
 
 **How the graders work.** A grader sees either the run's trace or one named file, so the checks are built two ways:
 
@@ -291,10 +307,12 @@ Reports that it worked are useful too. Please do not paste credentials, internal
 - Tested only in Claude Code. Cursor, Codex, Copilot and other agents are untested.
 - The marketplace install was tested without a model call; the model runs used `--plugin-dir`.
 - The strangers were Claude playing a stranger, not people.
-- The eval runs are small samples: three runs per case and arm, on Haiku, Sonnet and Opus (E10 on Sonnet only), and two
+- The eval runs are small samples: three runs per case and arm, on Haiku, Sonnet and Opus (E10–E12 on Sonnet only), and two
   simulated strangers per round.
 - **Weak spots measured:**
   - It does not start on a plain feature request unless the project opts in (see [Starting it](#starting-it)).
+  - With the first, broad opt-in line, the skill loaded on a three-file ops move in 2 of 3 runs and the agent then
+    edited without a plan (E12b). Nothing in the skill tells an agent to stop when it judges the work too small.
   - On Haiku, a bare "go ahead" about an existing plan did not load the skill (E9: 0 of 3), so name the skill when you
     resume on a small model.
   - The fixed re-measure date: on Sonnet, E3's "absolute date" check passed in 1 of 3 runs. The other two wrote a
