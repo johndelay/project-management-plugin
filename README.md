@@ -140,7 +140,7 @@ python3 skills/project-management/scripts/pm-check plans/my-plan.md [--config pm
 python3 skills/project-management/scripts/pm-check overlap --base <sha> <branch>... [--plan plans/my-plan.md]
 ```
 
-- Read-only. Needs Python 3 (standard library only) and git. One file of 1,303 lines and 54,779 bytes (`wc -l`, `wc -c`).
+- Read-only. Needs Python 3 (standard library only) and git. One file of 1,362 lines and 57,712 bytes (`wc -l`, `wc -c`).
 - Exit code **0** means no ERROR or WARN, **1** means at least one ERROR or WARN, and **2** means it could not check. Every
   run first checks a planted plan held inside the script; if that control does not get its expected findings, the run
   exits 2, so a broken checker never reports clean.
@@ -153,7 +153,7 @@ python3 skills/project-management/scripts/pm-check overlap --base <sha> <branch>
   `overlap`, it flags a file changed by two parallel branches, or a branch that changed files outside its stream's
   owned globs.
 - A plan without the `<!-- pm-template: v3 -->` marker (an older or hand-written plan) gets INFO lines only and exits 0.
-- Tests: `bash skills/project-management/scripts/test-pm-check.sh` runs 68 cases and exits 0 only if every case passes
+- Tests: `bash skills/project-management/scripts/test-pm-check.sh` runs 85 cases and exits 0 only if every case passes
   and the number of cases run matches.
 
 ## Optional: adversarial-review

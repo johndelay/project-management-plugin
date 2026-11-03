@@ -17,7 +17,7 @@ PY=${PYTHON:-python3}
 FX=$DIR/fixtures
 CFG=$FX/config-garden.md
 CLEAN=$FX/v3-clean.md
-EXPECTED_CASES=68   # one per expect / vcase / ccase call below; a skipped case turns the suite red
+EXPECTED_CASES=85   # one per expect / vcase / ccase call below; a skipped case turns the suite red
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pm-check-test.XXXXXX") || { echo "FAIL setup: mktemp -d failed"; exit 2; }
 trap 'rm -rf -- "$TMP"' EXIT
@@ -167,6 +167,65 @@ if plant "$CLEAN" "$TMP/struck-def.md" '- D4 — Push notifications become their
 else
   record FAIL p12-struck-definition-counts "could not plant the struck decision"
 fi
+# P12 group headers: a Decisions line that OPENS with a range is a header. It defines only its first id (as any
+# line does); an indented sub-item under it may define that id once more without a duplicate. Nothing else loosens.
+if plant "$CLEAN" "$TMP/p12-group.md" '- D1 — Build it; appetite 3 sessions.' \
+  $'- **D1…D2 — answered together at checkpoint A:**\n  - D1 — Build it; appetite 3 sessions.' \
+  '- **D2** — The alert threshold is 2 °C.' '  - **D2** — The alert threshold is 2 °C.' >/dev/null 2>&1; then
+  expect p12-group-header-with-items-is-clean 0 - noerr '^INFO P0 L0' -- "$PY" "$PMC" "$TMP/p12-group.md" --config "$CFG"
+else
+  record FAIL p12-group-header-with-items-is-clean "could not plant"
+fi
+if plant "$CLEAN" "$TMP/p12-group-alone.md" '- D4 — Push notifications become their own plan.' \
+  $'- D4 — Push notifications become their own plan.\n- D5..D6 — both deferred to the next plan.' \
+  'Gate (close): DONE — 2031-04-18, D1..D4' 'Gate (close): DONE — 2031-04-18, D1..D6' >/dev/null 2>&1; then
+  expect p12-group-header-alone-defines-first-only 1 P12 only '^ERROR P12 L[0-9]+: Gate \(close\) cites D6' -- "$PY" "$PMC" "$TMP/p12-group-alone.md" --config "$CFG"
+else
+  record FAIL p12-group-header-alone-defines-first-only "could not plant"
+fi
+vcase p12-dup-before-group-header P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- **D2** — The alert threshold is 2 °C.' $'- D1…D2 — answered together:\n- **D2** — The alert threshold is 2 °C.'
+vcase p12-two-group-headers P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- D1…D2 — answered together:\n- D1..D3 — again:\n  - D1 — Build it; appetite 3 sessions.'
+vcase p12-prose-range-defines-nothing-extra P12 only '^ERROR P12 L[0-9]+: Gate \(close\) cites D9' \
+  '- D1 — Build it; appetite 3 sessions.' '- D1 … 9 beds is too many; appetite 3 sessions.' \
+  'Gate (close): DONE — 2031-04-18, D1..D4' 'Gate (close): DONE — 2031-04-18, D1..D4, D9'
+vcase p12-redef-under-other-item P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- D1…D2 — answered together:\n- `D3` — Other item.\n  - D1 — Nested under the other item.'
+vcase p12-redef-under-other-header P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- D1…D2 — answered together:\n- D5..D6 — another group:\n  - D1 — Under the other header.'
+vcase p12-redef-after-paragraph P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- D1…D2 — answered together:\n\nA paragraph that closes the group.\n\n    - D1 — Much later.'
+vcase p12-prose-range-is-not-a-header P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- D1 … 9 beds is too many.\n  - D1 — Build it; appetite 3 sessions.'
+vcase p12-group-ends-at-section P12 only '^ERROR P12 L[0-9]+: decision D5 is defined twice' \
+  '- D4 — Push notifications become their own plan.' $'- D4 — Push notifications become their own plan.\n- D5…D6 — grouped:\n\n## Notes\nx\n\n## Decisions (more)\n  - D5 — In a later section.'
+vcase p12-group-ends-at-code-fence P12 only '^ERROR P12 L[0-9]+: decision D5 is defined twice' \
+  '- D4 — Push notifications become their own plan.' $'- D4 — Push notifications become their own plan.\n- D5…D6 — grouped:\n\n```\ncode\n```\n\n  - D5 — After the fence.'
+vcase p12-bare-range-is-not-a-header P12 only '^ERROR P12 L[0-9]+: decision D5 is defined twice' \
+  '- D4 — Push notifications become their own plan.' $'- D4 — Push notifications become their own plan.\n- D5…D6\n  - D5 — Under a bare range.'
+for sep in en:'–' hyphen:'-'; do
+  n=${sep%%:*}; c=${sep#*:}; c=${c//\'/}
+  if plant "$CLEAN" "$TMP/p12-sep-$n.md" '- D1 — Build it; appetite 3 sessions.' \
+    "- D1…D2 $c answered together"$'\n  - D1 — Build it; appetite 3 sessions.' >/dev/null 2>&1; then
+    expect p12-group-header-sep-$n 0 - noerr '^INFO P0 L0' -- "$PY" "$PMC" "$TMP/p12-sep-$n.md" --config "$CFG"
+  else
+    record FAIL p12-group-header-sep-$n "could not plant"
+  fi
+done
+if plant "$FX/legacy.md" "$TMP/p12-dated-prefix.md" '- D-2031-03-01-02 — Build it.' \
+  $'- D-2031-03-01-02…D-2031-04-01-09 — grouped:\n  - D-2031-03-01-02 — Build it.' >/dev/null 2>&1; then
+  expect p12-dated-range-prefix-mismatch-is-not-a-header 0 - noerr 'decision D-2031-03-01-02 is defined twice' \
+    -- "$PY" "$PMC" "$TMP/p12-dated-prefix.md" --config "$FX/config-legacy.md"
+else
+  record FAIL p12-dated-range-prefix-mismatch-is-not-a-header "could not plant"
+fi
+big=$(printf '9%.0s' $(seq 5000))
+vcase p12-huge-id-range-no-crash P12 only '^ERROR P12 L[0-9]+: decision D1 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' "- D1 — Build it."$'\n'"- D${big}…D9${big} — grouped:"$'\n'"- D1 — Again."
+vcase p12-dup-under-group-header P12 only '^ERROR P12 L[0-9]+: decision D2 is defined twice' \
+  '- D1 — Build it; appetite 3 sessions.' $'- **D1…D2 — answered together:**\n  - D1 — Build it; appetite 3 sessions.' \
+  '- **D2** — The alert threshold is 2 °C.' $'  - **D2** — The alert threshold is 2 °C.\n  - D2 — A second meaning.'
 vcase p13-placeholder-left P13 only '^ERROR P13 L[0-9]+: placeholder \{\{one-sentence goal\}\}' \
   'A gardener sees a frost warning on the evening before a forecast frost.' '{{one-sentence goal}}'
 vcase p15-build-without-go P15 only '^ERROR P15 L[0-9]+: Gate \(build\) is .* while Gate \(plan\)' \

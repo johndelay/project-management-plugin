@@ -687,24 +687,83 @@ def rule_p11(plan, cfg):
     return out
 
 
+def _indent(line):
+    return len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+
+
+def _num_key(digits):                                 # compares digit strings of any length without int()
+    d = digits.lstrip("0") or "0"
+    return (len(d), d)
+
+
+def _is_group_header(line, m2, rx):
+    r = _RANGE.match(line, m2.end())
+    if not r:
+        return False
+    m3 = rx.match(line, r.end()) or _RANGE_END.match(line, r.end())
+    if not m3:
+        return False
+    a = re.match(r"(.*?)(\d+)$", m2.group(0))
+    b = re.match(r"(.*?)(\d+)$", m3.group(0))
+    if not a or not b:
+        return False
+    if b.group(1) and b.group(1) != a.group(1):
+        return False                                  # a full-id end must share the first id's prefix
+    if _num_key(b.group(2)) <= _num_key(a.group(2)):
+        return False                                  # descending or self range: not a header
+    rest = line[m3.end():].lstrip("*_` \t")
+    return rest[:1] in ("—", "–", "-", ":") and rest != ""   # a separator is required, not prose or nothing
+
+
 def rule_p12(plan, cfg):
     rx = cfg["id_re"]
-    out, defined = [], {}
+    out, defined, grouped = [], {}, {}
+    stack = []                      # open group headers as (indent, first id), innermost last
+    def close(depth):               # end every group whose header is at `depth` or deeper
+        while stack and stack[-1][0] >= depth:
+            gd = stack.pop()[1]
+            if gd in grouped:
+                defined.setdefault(gd, grouped.pop(gd))
     decisions = plan.section("Decisions")
     for _, s, e in decisions:
         for i in range(s, e):
+            line = plan.lines[i]
+            # A header's group ends at the next non-blank line (a code fence included) that is not indented
+            # deeper than the header; from then on its first id counts as defined, and a re-definition is a duplicate.
+            if line.strip():
+                close(_indent(line))
             if plan.in_code[i]:
                 continue
-            m = _DEFLINE.match(plan.lines[i])
-            m2 = rx.match(plan.lines[i], m.end()) if m else None
+            m = _DEFLINE.match(line)
+            m2 = rx.match(line, m.end()) if m else None
             if not m2:
                 continue
             d = m2.group(0)
-            if d in defined:
+            # A line that OPENS with an ascending range followed by a separator (`- **D3…D8 — answered together:**`)
+            # is a group header. It defines only its FIRST id, exactly as any other line does, so it can never define
+            # more than before. The one allowance: a sub-item inside its group may define that first id once more.
+            if _is_group_header(line, m2, rx):
+                if d in defined or d in grouped:
+                    first = defined.get(d, grouped.get(d))
+                    out.append(("ERROR", "P12", i + 1, "decision %s is defined twice (first at L%d)"
+                                % (d, first + 1)))
+                else:
+                    grouped[d] = i
+                    stack.append((_indent(line), d))
+                continue
+            if d in grouped:
+                grouped.pop(d)                 # its header's own sub-item: one definition, not two
+                defined[d] = i
+                continue
+            if d in defined or d in grouped:
+                first = defined.get(d, grouped.get(d))
                 out.append(("ERROR", "P12", i + 1, "decision %s is defined twice (first at L%d)"
-                            % (d, defined[d] + 1)))
+                            % (d, first + 1)))
             else:
                 defined[d] = i
+        close(0)                    # a group never runs past the end of its section
+    for d, i in grouped.items():
+        defined.setdefault(d, i)
     if not decisions:
         return out                # no Decisions section: the 'cited but undefined' half is skipped
     for g in plan.gates:

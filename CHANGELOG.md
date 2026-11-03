@@ -5,7 +5,18 @@ of the public history, made by hand, and gets the same checks before it is pushe
 every commit and tag for terms that must not be published (after a planted term proves it can hit), the identity check, the install test in an empty
 home directory, and two clean review passes of what ships.
 
-## README revision after 3.0.0 (docs only; the `project-management--v3.0.0` tag predates it)
+## 3.0.1
+
+### Fixed
+- `pm-check`: a Decisions line that opens with an ascending id range followed by a separator (`—`, `–`, `-` or `:`),
+  such as `- D3…D8 — answered together:`, is read as a group header. Its group runs until the next non-blank line
+  (a code fence or heading included) that is not indented deeper than the header, and never past its section.
+  Inside the group, a line at any depth may define the header's first id once more without a duplicate error. That is the
+  only change: the header still defines only its first id, and every other duplicate or undefined citation that
+  3.0.0 reported is still reported (a duplicate's "first at" line may now point at the sub-item). Seventeen new suite
+  cases cover the allowance and the cases around it.
+
+## README revision after 3.0.0 (docs only; pushed after the v3.0.0 tag, included in 3.0.1)
 
 - The `CLAUDE.md` opt-in line for plain feature requests is narrower: new features, new projects and builds that span
   sessions, not routine ops, config changes, fixes or investigations. The broad first version started the skill on a

@@ -1,6 +1,6 @@
 {
   "name": "project-management",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Plan a feature or project through gated phases: value check, spec, independent review, a parallel execution plan, a build verified on the merged tree, and a close that re-measures value. Ships a read-only plan checker.",
   "author": {
     "name": "John DeLay",
